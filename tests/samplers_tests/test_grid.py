@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from collections.abc import Sequence
 from collections.abc import ValuesView
 import itertools
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -16,6 +17,7 @@ from optuna.testing.objectives import fail_objective
 from optuna.testing.objectives import pruned_objective
 from optuna.testing.storages import StorageSupplier
 from optuna.trial import Trial
+from optuna.trial import TrialState
 
 
 def test_study_optimize_with_single_search_space() -> None:
@@ -262,3 +264,228 @@ def test_is_exhausted() -> None:
     assert not sampler.is_exhausted(study)
     study.optimize(lambda trial: trial.suggest_categorical("a", [0, 50]))
     assert sampler.is_exhausted(study)
+
+
+def test_conditional_grid_enumeration() -> None:
+    search_space = {
+        "kernel": ["linear", "rbf"],
+        "gamma": ["scale", "auto"],
+    }
+    conditions = {"gamma": {"kernel": ["rbf"]}}
+    sampler = samplers.GridSampler(search_space, conditions=conditions)
+
+    expected_grids = [
+        {"kernel": "linear"},
+        {"kernel": "rbf", "gamma": "scale"},
+        {"kernel": "rbf", "gamma": "auto"},
+    ]
+    assert len(sampler) == 3
+    assert sampler.all_grids == expected_grids
+    assert list(sampler) == expected_grids
+
+
+def test_conditional_grid_enumeration_with_multiple_levels() -> None:
+    search_space = {
+        "kernel": ["linear", "poly", "rbf"],
+        "degree": [2, 3],
+        "coef0": [0.0, 1.0],
+        "gamma": ["scale", "auto"],
+    }
+    conditions = {
+        "degree": {"kernel": ["poly"]},
+        "coef0": {"kernel": ["poly"], "degree": [3]},
+        "gamma": {"kernel": ["poly", "rbf"]},
+    }
+    sampler = samplers.GridSampler(search_space, conditions=conditions)
+
+    expected_grids = [
+        {"kernel": "linear"},
+        {"kernel": "poly", "degree": 2, "gamma": "scale"},
+        {"kernel": "poly", "degree": 2, "gamma": "auto"},
+        {"kernel": "poly", "degree": 3, "gamma": "scale", "coef0": 0.0},
+        {"kernel": "poly", "degree": 3, "gamma": "scale", "coef0": 1.0},
+        {"kernel": "poly", "degree": 3, "gamma": "auto", "coef0": 0.0},
+        {"kernel": "poly", "degree": 3, "gamma": "auto", "coef0": 1.0},
+        {"kernel": "rbf", "gamma": "scale"},
+        {"kernel": "rbf", "gamma": "auto"},
+    ]
+    assert len(sampler) == 9
+    assert sampler.all_grids == expected_grids
+
+
+@pytest.mark.parametrize(
+    "conditions",
+    [
+        {"gamma": {"unknown": ["rbf"]}},
+        {"unknown": {"kernel": ["rbf"]}},
+        {"gamma": {"kernel": ["unknown"]}},
+        {"kernel": {"gamma": ["scale"]}, "gamma": {"kernel": ["rbf"]}},
+        {
+            "gamma": {"kernel": ["rbf"]},
+            "degree": {"gamma": ["scale"]},
+            "kernel": {"degree": [2]},
+        },
+    ],
+)
+def test_conditional_grid_invalid_conditions(conditions: dict[str, object]) -> None:
+    search_space = {
+        "kernel": ["linear", "rbf"],
+        "gamma": ["scale", "auto"],
+        "degree": [2],
+    }
+    with pytest.raises(ValueError):
+        samplers.GridSampler(search_space, conditions=conditions)  # type: ignore[arg-type]
+
+
+def test_conditional_grid_study_uses_only_active_parameters() -> None:
+    def objective(trial: Trial) -> float:
+        kernel = trial.suggest_categorical("kernel", ["linear", "rbf"])
+        if kernel == "rbf":
+            trial.suggest_categorical("gamma", ["scale", "auto"])
+        return 0.0
+
+    search_space = {"kernel": ["linear", "rbf"], "gamma": ["scale", "auto"]}
+    conditions = {"gamma": {"kernel": ["rbf"]}}
+    study = optuna.create_study(
+        sampler=samplers.GridSampler(search_space, conditions=conditions, seed=0)
+    )
+    study.optimize(objective)
+
+    expected_grids = [
+        {"kernel": "linear"},
+        {"kernel": "rbf", "gamma": "scale"},
+        {"kernel": "rbf", "gamma": "auto"},
+    ]
+    assert len(study.trials) == len(expected_grids)
+    assert {frozenset(trial.params.items()) for trial in study.trials} == {
+        frozenset(grid.items()) for grid in expected_grids
+    }
+    assert all(
+        "gamma" not in trial.distributions
+        for trial in study.trials
+        if trial.params["kernel"] == "linear"
+    )
+
+
+def test_conditional_grid_inactive_parameter_is_not_sampled() -> None:
+    def objective(trial: Trial) -> float:
+        kernel = trial.suggest_categorical("kernel", ["linear", "rbf"])
+        trial.suggest_categorical("gamma", ["scale", "auto"])
+        return 0.0 if kernel == "rbf" else 1.0
+
+    search_space = {"kernel": ["linear", "rbf"], "gamma": ["scale", "auto"]}
+    conditions = {"gamma": {"kernel": ["rbf"]}}
+    study = optuna.create_study(
+        sampler=samplers.GridSampler(search_space, conditions=conditions, seed=0)
+    )
+    with pytest.raises(ValueError, match="gamma"):
+        study.optimize(objective)
+
+
+def test_conditional_grid_resume_matches_equivalent_configurations(tmp_path: Path) -> None:
+    search_space = {"kernel": ["linear", "rbf"], "gamma": ["scale", "auto"]}
+    conditions = {"gamma": {"kernel": ["rbf"]}}
+    storage = f"sqlite:///{tmp_path / 'conditional-grid.db'}"
+
+    study = optuna.create_study(
+        study_name="conditional-grid",
+        storage=storage,
+        sampler=samplers.GridSampler(search_space, conditions=conditions, seed=0),
+    )
+    study.add_trial(
+        optuna.create_trial(
+            state=TrialState.COMPLETE,
+            value=0.0,
+            params={"kernel": "rbf", "gamma": "scale"},
+            distributions={
+                "kernel": optuna.distributions.CategoricalDistribution(["linear", "rbf"]),
+                "gamma": optuna.distributions.CategoricalDistribution(["scale", "auto"]),
+            },
+            system_attrs={
+                "search_space": {
+                    "gamma": ["scale", "auto"],
+                    "kernel": ["linear", "rbf"],
+                },
+                "conditions": {"gamma": {"kernel": ["rbf"]}},
+                "grid_id": 2,
+            },
+        )
+    )
+
+    resumed_sampler = samplers.GridSampler(
+        {"gamma": ["auto", "scale"], "kernel": ["rbf", "linear"]},
+        conditions={"gamma": {"kernel": ["rbf"]}},
+        seed=1,
+    )
+    resumed_study = optuna.load_study(
+        study_name="conditional-grid", storage=storage, sampler=resumed_sampler
+    )
+
+    def objective(trial: Trial) -> float:
+        kernel = trial.suggest_categorical("kernel", ["linear", "rbf"])
+        if kernel == "rbf":
+            trial.suggest_categorical("gamma", ["scale", "auto"])
+        return 0.0
+
+    resumed_study.optimize(objective)
+    assert len(resumed_study.trials) == 3
+    assert {frozenset(trial.params.items()) for trial in resumed_study.trials} == {
+        frozenset({"kernel": "rbf", "gamma": "scale"}.items()),
+        frozenset({"kernel": "linear"}.items()),
+        frozenset({"kernel": "rbf", "gamma": "auto"}.items()),
+    }
+
+
+def test_conditional_grid_compatibility_after_condition_change() -> None:
+    search_space = {
+        "kernel": ["linear", "rbf"],
+        "gamma": ["scale", "auto"],
+        "shrinking": [True, False],
+    }
+    old_conditions = {"gamma": {"kernel": ["rbf"]}}
+    new_conditions = {
+        "gamma": {"kernel": ["rbf"]},
+        "shrinking": {"kernel": ["rbf"]},
+    }
+    sampler = samplers.GridSampler(search_space, conditions=new_conditions)
+    study = optuna.create_study(sampler=sampler)
+
+    compatible_old_trial = optuna.create_trial(
+        state=TrialState.COMPLETE,
+        value=0.0,
+        params={"kernel": "linear"},
+        distributions={
+            "kernel": optuna.distributions.CategoricalDistribution(["linear", "rbf"]),
+        },
+        system_attrs={
+            "search_space": {
+                "kernel": ["linear", "rbf"],
+                "gamma": ["scale", "auto"],
+            },
+            "conditions": old_conditions,
+            "grid_id": 0,
+        },
+    )
+    incompatible_old_trial = optuna.create_trial(
+        state=TrialState.COMPLETE,
+        value=0.0,
+        params={"kernel": "rbf", "gamma": "scale"},
+        distributions={
+            "kernel": optuna.distributions.CategoricalDistribution(["linear", "rbf"]),
+            "gamma": optuna.distributions.CategoricalDistribution(["scale", "auto"]),
+        },
+        system_attrs={
+            "search_space": search_space,
+            "conditions": old_conditions,
+            "grid_id": 1,
+        },
+    )
+    study.add_trial(compatible_old_trial)
+    study.add_trial(incompatible_old_trial)
+
+    unvisited_params = [
+        sampler.all_grids[grid_id] for grid_id in sampler._get_unvisited_grid_ids(study)
+    ]
+    assert {"kernel": "linear"} not in unvisited_params
+    assert {"kernel": "rbf", "gamma": "scale", "shrinking": True} in unvisited_params
+    assert {"kernel": "rbf", "gamma": "scale", "shrinking": False} in unvisited_params

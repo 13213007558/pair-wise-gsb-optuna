@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-import itertools
+from collections import deque
+from collections.abc import Mapping
 from numbers import Real
 from typing import Any
 from typing import TYPE_CHECKING
@@ -16,7 +17,7 @@ from optuna.trial import TrialState
 
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Iterator
     from collections.abc import Sequence
 
     from optuna.distributions import BaseDistribution
@@ -25,16 +26,47 @@ if TYPE_CHECKING:
 
 
 GridValueType = Union[str, float, int, bool, None]
+GridConfigType = dict[str, GridValueType]
+
+if TYPE_CHECKING:
+    GridConditionType = Mapping[str, Mapping[str, Sequence[GridValueType]]]
 
 
 _logger = get_logger(__name__)
 
 
 class GridSampler(BaseSampler):
-    """Sampler that performs exhaustive search over the define-and-run user-specified grids.
+    """Sampler that performs exhaustive search over user-specified grids.
 
     With :class:`~optuna.samplers.GridSampler`, the trials suggest all combinations of parameters
-    in the given search space during the study.
+    in the given search space during the study. Conditional parameters can be declared with
+    ``conditions`` so that parameters are included only in configurations where their parent
+    parameters take the declared values.
+
+    Example:
+
+        .. testcode::
+
+            import optuna
+
+
+            def objective(trial):
+                kernel = trial.suggest_categorical("kernel", ["linear", "rbf"])
+                if kernel == "rbf":
+                    gamma = trial.suggest_categorical("gamma", ["scale", "auto"])
+                return 0
+
+
+            search_space = {"kernel": ["linear", "rbf"], "gamma": ["scale", "auto"]}
+            conditions = {"gamma": {"kernel": ["rbf"]}}
+            sampler = optuna.samplers.GridSampler(search_space, conditions=conditions)
+            assert sampler.all_grids == [
+                {"kernel": "linear"},
+                {"kernel": "rbf", "gamma": "scale"},
+                {"kernel": "rbf", "gamma": "auto"},
+            ]
+            study = optuna.create_study(sampler=sampler)
+            study.optimize(objective)
 
     .. note::
         :class:`~optuna.samplers.BruteForceSampler` also provides the exhaustive search feature.
@@ -105,6 +137,11 @@ class GridSampler(BaseSampler):
         search_space:
             A dictionary whose key and value are a parameter name and the corresponding candidates
             of values, respectively.
+        conditions:
+            Activation rules for conditional parameters. Each key is a parameter name and its
+            value maps parent parameter names to parent values for which the key is active. All
+            listed parent rules must match. Parent references must exist in ``search_space`` and
+            must not form a cycle.
         seed:
             A seed to fix the order of trials as the grid is randomly shuffled. This shuffle is
             beneficial when the number of grids is larger than ``n_trials`` in
@@ -114,7 +151,11 @@ class GridSampler(BaseSampler):
     """
 
     def __init__(
-        self, search_space: Mapping[str, Sequence[GridValueType]], seed: int | None = None
+        self,
+        search_space: Mapping[str, Sequence[GridValueType]],
+        seed: int | None = None,
+        *,
+        conditions: GridConditionType | None = None,
     ) -> None:
         for param_name, param_values in search_space.items():
             for value in param_values:
@@ -124,11 +165,27 @@ class GridSampler(BaseSampler):
         for param_name, param_values in sorted(search_space.items()):
             self._search_space[param_name] = list(param_values)
 
-        self._all_grids = list(itertools.product(*self._search_space.values()))
-        self._param_names = sorted(search_space.keys())
+        self._conditions = self._validate_and_normalize_conditions(self._search_space, conditions)
+        self._param_order = self._get_conditional_param_order(self._search_space, self._conditions)
+        self._all_grids = self._generate_grids(
+            self._search_space, self._conditions, self._param_order
+        )
         self._n_min_trials = len(self._all_grids)
         self._rng = LazyRandomState(seed or 0)
-        self._rng.rng.shuffle(self._all_grids)  # type: ignore[arg-type]
+        self._grid_order = list(range(self._n_min_trials))
+        self._rng.rng.shuffle(self._grid_order)
+
+    @property
+    def all_grids(self) -> list[GridConfigType]:
+        """Return all reachable grid configurations in a deterministic order."""
+        return [grid.copy() for grid in self._all_grids]
+
+    def __len__(self) -> int:
+        return self._n_min_trials
+
+    def __iter__(self) -> Iterator[GridConfigType]:
+        for grid in self._all_grids:
+            yield grid.copy()
 
     def reseed_rng(self) -> None:
         self._rng.rng.seed()
@@ -144,34 +201,31 @@ class GridSampler(BaseSampler):
         if "grid_id" in trial.system_attrs or "fixed_params" in trial.system_attrs:
             return
 
-        if 0 <= trial.number and trial.number < self._n_min_trials:
-            study._storage.set_trial_system_attr(
-                trial._trial_id, "search_space", self._search_space
-            )
-            study._storage.set_trial_system_attr(trial._trial_id, "grid_id", trial.number)
-            return
-
         target_grids = self._get_unvisited_grid_ids(study)
 
-        if len(target_grids) == 0:
-            # This case may occur with distributed optimization or trial queue. If there is no
-            # target grid, `GridSampler` evaluates a visited, duplicated point with the current
-            # trial. After that, the optimization stops.
+        if 0 <= trial.number < self._n_min_trials and len(target_grids) == self._n_min_trials:
+            grid_id = self._grid_order[trial.number]
+        else:
+            if len(target_grids) == 0:
+                # This case may occur with distributed optimization or trial queue. If there is no
+                # target grid, `GridSampler` evaluates a visited, duplicated point with the
+                # current trial. After that, the optimization stops.
+                _logger.warning(
+                    "`GridSampler` is re-evaluating a configuration because the grid has been "
+                    "exhausted. This may happen due to a timing issue during distributed "
+                    "optimization or when re-running optimizations on already finished studies."
+                )
 
-            _logger.warning(
-                "`GridSampler` is re-evaluating a configuration because the grid has been "
-                "exhausted. This may happen due to a timing issue during distributed optimization "
-                "or when re-running optimizations on already finished studies."
-            )
+                # One of all grids is randomly picked up in this case.
+                target_grids = list(range(len(self._all_grids)))
 
-            # One of all grids is randomly picked up in this case.
-            target_grids = list(range(len(self._all_grids)))
-
-        # In distributed optimization, multiple workers may simultaneously pick up the same grid.
-        # To make the conflict less frequent, the grid is chosen randomly.
-        grid_id = int(self._rng.rng.choice(target_grids))
+            # In distributed optimization, multiple workers may simultaneously pick up the same
+            # grid. To make the conflict less frequent, the grid is chosen randomly.
+            grid_id = int(self._rng.rng.choice(target_grids))
 
         study._storage.set_trial_system_attr(trial._trial_id, "search_space", self._search_space)
+        if self._conditions:
+            study._storage.set_trial_system_attr(trial._trial_id, "conditions", self._conditions)
         study._storage.set_trial_system_attr(trial._trial_id, "grid_id", grid_id)
 
     def infer_relative_search_space(
@@ -200,7 +254,16 @@ class GridSampler(BaseSampler):
             raise ValueError(message)
 
         grid_id = trial.system_attrs["grid_id"]
-        param_value = self._all_grids[grid_id][self._param_names.index(param_name)]
+        grid = self._all_grids[grid_id]
+        if param_name not in grid:
+            message = (
+                f"The parameter name, {param_name}, is not active in grid {grid_id} with "
+                f"parameters {grid}. Please align the objective's parameter conditions with "
+                "the sampler's `conditions`."
+            )
+            raise ValueError(message)
+
+        param_value = grid[param_name]
         contains = param_distribution._contains(param_distribution.to_internal_repr(param_value))
         if not contains:
             optuna_warn(
@@ -222,7 +285,7 @@ class GridSampler(BaseSampler):
         if len(target_grids) == 0:
             study.stop()
         elif len(target_grids) == 1:
-            grid_id = study._storage.get_trial_system_attrs(trial._trial_id)["grid_id"]
+            grid_id = study._storage.get_trial_system_attrs(trial._trial_id).get("grid_id")
             if grid_id == target_grids[0]:
                 study.stop()
 
@@ -249,13 +312,11 @@ class GridSampler(BaseSampler):
         trials = study._storage.get_all_trials(study._study_id, deepcopy=False)
 
         for t in trials:
-            if "grid_id" in t.system_attrs and self._same_search_space(
-                t.system_attrs["search_space"]
-            ):
-                if t.state.is_finished():
-                    visited_grids.append(t.system_attrs["grid_id"])
-                elif t.state == TrialState.RUNNING:
-                    running_grids.append(t.system_attrs["grid_id"])
+            grid_ids = self._get_trial_grid_ids(t)
+            if t.state.is_finished():
+                visited_grids.extend(grid_ids)
+            elif t.state == TrialState.RUNNING:
+                running_grids.extend(grid_ids)
 
         unvisited_grids = set(range(self._n_min_trials)) - set(visited_grids) - set(running_grids)
 
@@ -285,6 +346,185 @@ class GridSampler(BaseSampler):
                     return False
 
         return True
+
+    def _same_conditions(
+        self, conditions: Mapping[str, Mapping[str, Sequence[GridValueType]]]
+    ) -> bool:
+        if set(conditions.keys()) != set(self._conditions.keys()):
+            return False
+
+        for param_name in self._conditions:
+            expected = conditions[param_name]
+            actual = self._conditions[param_name]
+            if set(expected.keys()) != set(actual.keys()):
+                return False
+            for parent_name in actual:
+                expected_values = list(expected[parent_name])
+                actual_values = list(actual[parent_name])
+                if len(expected_values) != len(actual_values):
+                    return False
+                if not all(
+                    self._grid_value_equal(expected_value, actual_value)
+                    for expected_value, actual_value in zip(expected_values, actual_values)
+                ):
+                    return False
+
+        return True
+
+    def _get_trial_grid_ids(self, trial: FrozenTrial) -> list[int]:
+        system_attrs = trial.system_attrs
+        grid_id = system_attrs.get("grid_id")
+        search_space = system_attrs.get("search_space")
+        conditions = system_attrs.get("conditions")
+
+        if not self._conditions:
+            if (
+                search_space is not None
+                and self._same_search_space(search_space)
+                and isinstance(grid_id, int)
+                and 0 <= grid_id < self._n_min_trials
+            ):
+                return [grid_id]
+            return []
+
+        uses_current_grid = (
+            search_space is not None
+            and self._same_search_space(search_space)
+            and (
+                (not self._conditions and "conditions" not in system_attrs)
+                or (
+                    self._conditions
+                    and conditions is not None
+                    and self._same_conditions(conditions)
+                )
+            )
+        )
+        if uses_current_grid and isinstance(grid_id, int) and 0 <= grid_id < self._n_min_trials:
+            return [grid_id]
+
+        return [
+            grid_id
+            for grid_id, grid in enumerate(self._all_grids)
+            if self._same_grid_config(trial.params, grid)
+        ]
+
+    def _same_grid_config(self, params: Mapping[str, GridValueType], grid: GridConfigType) -> bool:
+        if set(params.keys()) != set(grid.keys()):
+            return False
+        return all(self._grid_value_equal(params[name], value) for name, value in grid.items())
+
+    @staticmethod
+    def _value_in_values(value: GridValueType, values: Sequence[GridValueType]) -> bool:
+        return any(GridSampler._grid_value_equal(value, candidate) for candidate in values)
+
+    @classmethod
+    def _validate_and_normalize_conditions(
+        cls,
+        search_space: Mapping[str, Sequence[GridValueType]],
+        conditions: GridConditionType | None,
+    ) -> dict[str, dict[str, list[GridValueType]]]:
+        if conditions is None:
+            return {}
+
+        normalized_conditions: dict[str, dict[str, list[GridValueType]]] = {}
+        for param_name, parent_conditions in conditions.items():
+            if param_name not in search_space:
+                raise ValueError(
+                    f"Conditional parameter `{param_name}` is not found in the search space."
+                )
+            if not isinstance(parent_conditions, Mapping):
+                raise ValueError(f"Conditions for `{param_name}` must be a mapping.")
+
+            normalized_parent_conditions: dict[str, list[GridValueType]] = {}
+            for parent_name, parent_values in parent_conditions.items():
+                if parent_name not in search_space:
+                    raise ValueError(
+                        f"Condition parent `{parent_name}` of `{param_name}` is not found in "
+                        "the search space."
+                    )
+                invalid_values = [
+                    value
+                    for value in parent_values
+                    if not cls._value_in_values(value, search_space[parent_name])
+                ]
+                if invalid_values:
+                    raise ValueError(
+                        f"Condition values {invalid_values} for `{parent_name}` are not included "
+                        f"in the grid of `{parent_name}`."
+                    )
+                normalized_parent_conditions[parent_name] = [
+                    value
+                    for value in search_space[parent_name]
+                    if cls._value_in_values(value, parent_values)
+                ]
+            normalized_conditions[param_name] = normalized_parent_conditions
+
+        return {
+            param_name: normalized_conditions[param_name]
+            for param_name in sorted(normalized_conditions)
+        }
+
+    @staticmethod
+    def _get_conditional_param_order(
+        search_space: Mapping[str, Sequence[GridValueType]],
+        conditions: Mapping[str, Mapping[str, Sequence[GridValueType]]],
+    ) -> list[str]:
+        indegrees = {param_name: 0 for param_name in search_space}
+        children: dict[str, list[str]] = {param_name: [] for param_name in search_space}
+        for param_name, parent_conditions in conditions.items():
+            indegrees[param_name] = len(parent_conditions)
+            for parent_name in parent_conditions:
+                children[parent_name].append(param_name)
+
+        ready = deque(
+            sorted(param_name for param_name, degree in indegrees.items() if degree == 0)
+        )
+        ordered_param_names = []
+        while ready:
+            param_name = ready.popleft()
+            ordered_param_names.append(param_name)
+            for child_name in sorted(children[param_name]):
+                indegrees[child_name] -= 1
+                if indegrees[child_name] == 0:
+                    ready.append(child_name)
+
+        if len(ordered_param_names) != len(search_space):
+            cyclic_parameters = sorted(set(search_space) - set(ordered_param_names))
+            raise ValueError(
+                "Cyclic parameter conditions are not allowed. Parameters involved in the cycle: "
+                f"{cyclic_parameters}."
+            )
+
+        return ordered_param_names
+
+    @classmethod
+    def _generate_grids(
+        cls,
+        search_space: Mapping[str, Sequence[GridValueType]],
+        conditions: Mapping[str, Mapping[str, Sequence[GridValueType]]],
+        param_order: Sequence[str],
+    ) -> list[GridConfigType]:
+        grids: list[GridConfigType] = [{}]
+        for param_name in param_order:
+            parent_conditions = conditions.get(param_name)
+            next_grids: list[GridConfigType] = []
+            for grid in grids:
+                if parent_conditions is None:
+                    active_values = search_space[param_name]
+                elif not all(
+                    parent_name in grid and cls._value_in_values(grid[parent_name], parent_values)
+                    for parent_name, parent_values in parent_conditions.items()
+                ):
+                    next_grids.append(grid.copy())
+                    continue
+                active_values = search_space[param_name]
+
+                for value in active_values:
+                    next_grid = grid.copy()
+                    next_grid[param_name] = value
+                    next_grids.append(next_grid)
+            grids = next_grids
+        return grids
 
     def is_exhausted(self, study: Study) -> bool:
         """
