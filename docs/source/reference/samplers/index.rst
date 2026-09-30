@@ -97,6 +97,7 @@ The :mod:`~optuna.samplers` module defines a base class for parameter sampling a
     NSGAIISampler
     NSGAIIISampler
     GridSampler
+    ConditionalGridSampler
     QMCSampler
     BruteForceSampler
     PartialFixedSampler
